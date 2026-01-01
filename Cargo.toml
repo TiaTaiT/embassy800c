@@ -1,0 +1,50 @@
+[package]
+name = "embassy800c"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92.0"
+
+[package.metadata.probe-rs]
+minimum-version = "0.30.0"
+
+[[bin]]
+name = "embassy800c"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+# The core Embassy executor
+embassy-executor = { version = "0.9.1", features = ["arch-cortex-m", "executor-thread", "defmt"] }
+
+# STM32 Hardware Abstraction Layer
+# Using 'time-driver-any' so embassy-time works automatically
+embassy-stm32 = { version = "0.4.0", features = ["stm32f051r8", "time-driver-any", "memory-x", "unstable-pac", "exti"] }
+
+# Async time support
+embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime"] }
+
+# Support crates for Cortex-M0 hardware
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+
+# Logging and Panics
+defmt = "1.0.1"
+defmt-rtt = "1.1.0"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
+
+# Release profile `cargo run --release`
+[profile.release]
+opt-level = "z"        # Optimize for smallest binary size
+lto = true             # Optimize across crate boundaries
+codegen-units = 1      # Optimize the entire crate as one unit (better size/speed)
+incremental = false    # Disable incremental builds for even more optimization
+debug = 2              # Keep debug info (needed for defmt and probe-rs)
+
+# Dev profile `cargo run`
+[profile.dev]
+opt-level = "z"
+lto = true
+codegen-units = 1
+incremental = false
+debug = 2
