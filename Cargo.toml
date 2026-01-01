@@ -19,14 +19,19 @@ embassy-executor = { version = "0.9.1", features = ["arch-cortex-m", "executor-t
 
 # STM32 Hardware Abstraction Layer
 # Using 'time-driver-any' so embassy-time works automatically
-embassy-stm32 = { version = "0.4.0", features = ["stm32f051r8", "time-driver-any", "memory-x", "unstable-pac", "exti"] }
+embassy-stm32 = { version = "0.4.0", features = ["stm32f051r8", "time-driver-any", "memory-x", "unstable-pac", "exti", "defmt"] }
 
 # Async time support
 embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime"] }
 
+embassy-sync = { version = "0.7.2", features = ["defmt"] }
 # Support crates for Cortex-M0 hardware
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"
+
+heapless = { version = "0.9.2", features = ["defmt"] }
+embedded-io-async = "0.7.0"
+embassy-futures = "0.1.1"
 
 # Logging and Panics
 defmt = "1.0.1"

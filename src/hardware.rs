@@ -1,11 +1,11 @@
-// hardware.rs
+// /src/hardware.rs
 use embassy_stm32::adc::{Adc, SampleTime};
 use embassy_stm32::gpio::{AnyPin, Level, Output, Speed};
 use embassy_stm32::mode::Async;
 use embassy_stm32::peripherals::{self, ADC1, PA4, PA5, PA6};
 use embassy_stm32::rcc::{Hse, HseMode, Pll, PllMul, PllPreDiv, PllSource, Sysclk};
 use embassy_stm32::time::Hertz;
-use embassy_stm32::usart::{Config as UartConfig, Uart};
+use embassy_stm32::usart::{Config as UartConfig, Uart, UartRx, UartTx};
 use embassy_stm32::{adc, bind_interrupts, usart, Config, Peri};
 use defmt::info;
 
@@ -47,7 +47,8 @@ pub struct Board {
     pub analog_inputs: AnalogInputs, 
     pub alarm_outputs: AlarmOutputs,
     pub uart1: Uart1,
-    pub uart2: Uart2,
+    pub uart2_rx: UartRx<'static, Async>,
+    pub uart2_tx: UartTx<'static, Async>,
     pub leds: Leds,
     pub sim800_control: Sim800Control,
     pub _alarm_pullup: Output<'static>,
@@ -92,13 +93,13 @@ pub fn init() -> Board {
     // 4. USART2
     let mut config_u2 = UartConfig::default();
     config_u2.baudrate = 9600;
-    let uart2 = Uart::new(
+    let (uart2_tx, uart2_rx) = Uart::new(
         p.USART2,
         p.PA3, p.PA2,
         Irqs,
         p.DMA1_CH4, p.DMA1_CH5,
         config_u2,
-    ).unwrap();
+    ).unwrap().split();
 
     // 5. ADC
     let mut adc = Adc::new(p.ADC1, Irqs);
@@ -131,7 +132,8 @@ pub fn init() -> Board {
         analog_inputs,
         alarm_outputs,
         uart1,
-        uart2,
+        uart2_rx,
+        uart2_tx,
         leds,
         sim800_control,
         _alarm_pullup: alarm_pullup,
