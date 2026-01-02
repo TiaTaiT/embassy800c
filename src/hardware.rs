@@ -22,6 +22,7 @@ pub type Uart2Tx = UartTx<'static, Async>;
 pub type Adc1 = Adc<'static, ADC1>;
 
 pub struct AnalogInputs {
+    pub alarm_pullup: Output<'static>,
     pub alarm_in_1: Peri<'static, PA4>,
     pub alarm_in_2: Peri<'static, PA5>,
     pub alarm_in_3: Peri<'static, PA6>,
@@ -72,13 +73,13 @@ pub fn init() -> Board {
     info!("Hardware initialized! Clocked at 48MHz");
 
     // 2. Additional Outputs
-    let _alarm_pullup = Output::new(p.PA7, Level::High, Speed::Low); 
+    let alarm_pullup = Output::new(p.PA7, Level::High, Speed::Low); 
     
     let alarm_out_1 = Output::new(p.PB3, Level::High, Speed::Low);
     let alarm_out_2 = Output::new(p.PB4, Level::High, Speed::Low);
     let alarm_out_3 = Output::new(p.PB5, Level::High, Speed::Low);
-    let out_pc6 = Output::new(p.PC6, Level::Low, Speed::Low);
-    let out_pc7 = Output::new(p.PC7, Level::Low, Speed::Low);
+    let sim800_ttl = Output::new(p.PC6, Level::Low, Speed::Low);
+    let sim800_enable = Output::new(p.PC7, Level::Low, Speed::Low);
 
     // 3. USART1
     let mut config_u1 = UartConfig::default();
@@ -107,6 +108,7 @@ pub fn init() -> Board {
     adc.set_sample_time(SampleTime::CYCLES71_5);
 
     let analog_inputs = AnalogInputs {
+        alarm_pullup,
         alarm_in_1: p.PA4,
         alarm_in_2: p.PA5,
         alarm_in_3: p.PA6,
@@ -125,8 +127,8 @@ pub fn init() -> Board {
     };
 
     let sim800_control = Sim800Control {
-        sim800_enable: out_pc7,
-        sim800_ttl: out_pc6,
+        sim800_enable,
+        sim800_ttl,
     };
 
     Board {

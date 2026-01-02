@@ -1,7 +1,7 @@
 // /src/sim800.rs
 use embassy_time::{Duration, with_timeout, Timer};
 use heapless::String;
-use defmt::{info, error};
+use defmt::{info, error, warn};
 
 use crate::constants::*;
 use crate::custom_strings::{extract_between_delimiters, extract_after_delimiter, separate_chars_by_commas};
@@ -11,7 +11,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Sender, Receiver};
 
 // Types for communication
-#[derive(Clone, defmt::Format)]
+#[derive(Clone, defmt::Format, PartialEq)]
 pub enum Command {
     Init,
     SendMessage {
@@ -46,6 +46,8 @@ pub enum SimEvent {
     },
     DtmfReceived(char),
     CallEnded,
+    // Added CallExecuted variant to report status of outgoing alarm calls
+    CallExecuted(bool),
 }
 
 pub struct Sim800Driver {
@@ -55,6 +57,9 @@ pub struct Sim800Driver {
     phone_book: PhoneBook,
     // Buffer for reading lines
     line_buf: [u8; 128],
+    // Deduplication state
+    last_alarm_dtmf: String<DTMF_PACKET_LENGTH>,
+    last_alarm_time: u64,
 }
 
 impl Sim800Driver {
@@ -65,27 +70,26 @@ impl Sim800Driver {
             control,
             phone_book: PhoneBook::new(),
             line_buf: [0u8; 128],
+            last_alarm_dtmf: String::new(),
+            last_alarm_time: 0,
         }
     }
 
-    /// Read a line from UART, processing backspace/cr/lf
     async fn read_line(&mut self) -> Result<&str, ()> {
         let mut pos = 0;
         loop {
             let mut buf = [0u8; 1];
-            // Read 1 byte
             match self.rx.read(&mut buf).await {
                 Ok(_) => {
                     let b = buf[0];
                     if b == b'\n' {
-                        // End of line
                         if pos > 0 && self.line_buf[pos-1] == b'\r' {
                              pos -= 1;
                         }
                         if let Ok(s) = core::str::from_utf8(&self.line_buf[..pos]) {
                             return Ok(s);
                         } else {
-                            return Err(()); // Bad encoding
+                            return Err(());
                         }
                     } else if b != b'\r' {
                         if pos < self.line_buf.len() {
@@ -99,16 +103,11 @@ impl Sim800Driver {
         }
     }
     
-    // Low level send using inherent implementation of UartTx (DMA)
     async fn send_str(&mut self, s: &str) {
-        // FIX: Check for empty string to avoid DMA panic (mem_len > 0)
-        if s.is_empty() {
-            return;
-        }
+        if s.is_empty() { return; }
         let _ = self.tx.write(s.as_bytes()).await;
     }
 
-    // Command execution helpers
     async fn send_cmd_wait_ok(&mut self, cmd: &str, timeout_ms: u64) -> Result<(), ()> {
         self.send_str(cmd).await;
         self.send_str("\r\n").await;
@@ -118,7 +117,6 @@ impl Sim800Driver {
                 let mut cpbr_data: Option<String<MAX_PHONE_LENGTH>> = None;
                 
                 {
-                    // Inner scope: Borrow self for reading logic
                     let line = self.read_line().await?;
                     if line.trim() == "OK" { return Ok(()); }
                     if line.trim() == "ERROR" { return Err(()); }
@@ -131,9 +129,8 @@ impl Sim800Driver {
                             }
                         }
                     }
-                } // End borrow of self
+                }
 
-                // Mutate self based on collected data
                 if let Some(num) = cpbr_data {
                     let _ = self.phone_book.add_number(&num);
                 }
@@ -150,7 +147,6 @@ impl Sim800Driver {
         info!("Powering on SIM800...");
         Timer::after(Duration::from_secs(INIT_SIM800_DELAY_SECONDS as u64)).await;
         
-        // Basic Init Sequence
         let cmds = [
             "AT", "ATE0", "AT+CMEE=1", "AT+CLIP=1", "AT+CMGF=1",
             "AT+CSCS=\"GSM\"", "AT+CNMI=1,2,0,1,0", "AT+CSMP=49,167,0,0",
@@ -172,7 +168,6 @@ impl Sim800Driver {
             }
         }
 
-        // Load Phonebook
         for i in 1..=8 {
             let mut buf = String::<16>::new();
             use core::fmt::Write;
@@ -188,12 +183,10 @@ impl Sim800Driver {
         self.send_str(number).await;
         self.send_str("\"\r\n").await;
 
-        // Wait for prompt '>'
         let res = with_timeout(Duration::from_secs(5), async {
             loop {
                  let mut b = [0u8; 1];
                  if self.rx.read(&mut b).await.is_ok() {
-                     // Explicitly specify types: Result<(), ()>
                      if b[0] == b'>' { return Ok::<(), ()>(()); }
                  }
             }
@@ -205,7 +198,7 @@ impl Sim800Driver {
         let ctrl_z = [0x1Au8];
         let _ = self.tx.write(&ctrl_z).await;
 
-        self.send_cmd_wait_ok("", 10000).await // Wait for final OK
+        self.send_cmd_wait_ok("", 10000).await
     }
 
     pub async fn make_call_dtmf(&mut self, number: &str, dtmf: &str) -> Result<(), ()> {
@@ -239,16 +232,19 @@ impl Sim800Driver {
              self.send_cmd_wait_ok(&cmd, 5000).await?;
         }
 
-        let _ = with_timeout(Duration::from_secs(5), async {
+        let confirm_res = with_timeout(Duration::from_secs(5), async {
              loop {
                 let line = self.read_line().await?;
-                // Explicit type annotation
                 if line.contains("+DTMF: #") { return Ok::<(), ()>(()); }
              }
         }).await;
 
         self.send_cmd_wait_ok("AT+CHUP", 1000).await.ok();
-        Ok(())
+        
+        match confirm_res {
+            Ok(_) => Ok(()),
+            Err(_) => Err(()),
+        }
     }
 
     pub async fn handle_incoming_call_flow(&mut self, event_channel: &Sender<'static, CriticalSectionRawMutex, SimEvent, 4>) {
@@ -272,7 +268,6 @@ impl Sim800Driver {
                          event_channel.send(SimEvent::DtmfReceived(c)).await;
                      }
                 }
-                // Explicit type annotation
                 if dtmf_buf.len() >= DTMF_PACKET_LENGTH { return Ok::<(), ()>(()); }
                 if line.contains("NO CARRIER") { return Err(()); }
             }
@@ -293,10 +288,13 @@ impl Sim800Driver {
     ) {
         self.power_on().await;
         
+        let mut uptime_sec: u64 = 0;
+        
         loop {
             use embassy_futures::select::{select, Either};
             
             let selection = select(self.read_line(), cmd_channel.receive()).await;
+            uptime_sec += 1; 
 
             match selection {
                 Either::First(line_res) => {
@@ -345,12 +343,10 @@ impl Sim800Driver {
                         Command::SendAlarmSms { message } => {
                              let mut target_num = String::<MAX_PHONE_LENGTH>::new();
                              let mut found = false;
-                             
                              if let Some(num) = self.phone_book.get_first() {
                                  target_num.push_str(num).ok();
                                  found = true;
                              }
-
                              if found {
                                  let _ = self.send_sms(&target_num, &message).await;
                              }
@@ -358,15 +354,44 @@ impl Sim800Driver {
                         Command::CallAlarmWithDtmf { dtmf } => {
                              let mut target_num = String::<MAX_PHONE_LENGTH>::new();
                              let mut found = false;
-
                              if let Some(num) = self.phone_book.get_first() {
                                  target_num.push_str(num).ok();
                                  found = true;
                              }
                              
                              if found {
-                                 let _ = self.make_call_dtmf(&target_num, &dtmf).await;
+                                 // Check duplicate
+                                 let is_duplicate = (dtmf == self.last_alarm_dtmf) && 
+                                                    (uptime_sec.saturating_sub(self.last_alarm_time) < 120); 
+                                 
+                                 if is_duplicate {
+                                     warn!("Skipping duplicate alarm call for DTMF {} (Last: {}s ago)", dtmf, uptime_sec - self.last_alarm_time);
+                                     // Inform logic task that we treated this as "done"
+                                     event_channel.send(SimEvent::CallExecuted(true)).await;
+                                 } else {
+                                     info!("Calling Alarm: {} with DTMF: {}", target_num, dtmf);
+                                     match self.make_call_dtmf(&target_num, &dtmf).await {
+                                         Ok(_) => {
+                                             info!("Alarm confirmed (#).");
+                                             self.last_alarm_dtmf = dtmf.clone();
+                                             self.last_alarm_time = uptime_sec;
+                                             // Notify success
+                                             event_channel.send(SimEvent::CallExecuted(true)).await;
+                                         },
+                                         Err(_) => {
+                                             warn!("Alarm call failed/unconfirmed.");
+                                             // Notify failure
+                                             event_channel.send(SimEvent::CallExecuted(false)).await;
+                                         }
+                                     }
+                                 }
+                             } else {
+                                 warn!("No phone number for alarm call!");
+                                 event_channel.send(SimEvent::CallExecuted(false)).await;
                              }
+                        },
+                        Command::CallWithDtmf { phone_number, dtmf } => {
+                            let _ = self.make_call_dtmf(&phone_number, &dtmf).await;
                         },
                         Command::HandleIncomingCall { .. } => {
                             self.handle_incoming_call_flow(&event_channel).await;
@@ -374,7 +399,6 @@ impl Sim800Driver {
                         Command::UpdateTime => {
                             self.send_cmd_wait_ok("AT+CCLK?", 1000).await.ok();
                         },
-                        _ => {}
                     }
                 }
             }

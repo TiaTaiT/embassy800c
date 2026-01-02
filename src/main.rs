@@ -2,7 +2,7 @@
 #![no_std]
 #![no_main]
 
-use defmt::info;
+use defmt::{info, warn};
 use defmt_rtt as _;
 use panic_probe as _;
 
@@ -41,7 +41,6 @@ struct SystemState {
 }
 
 static STATE: Mutex<CriticalSectionRawMutex, SystemState> = Mutex::new(SystemState {
-    // Corrected to use the public `new` constructor
     alarm_stack: AlarmStack::new(), 
     alive_countdown: 0,
     cancellation_token: 0,
@@ -86,6 +85,10 @@ async fn adc_monitor_task(mut inputs: AnalogInputs) {
         let val1 = adc.read(&mut inputs.alarm_in_1).await;
         let val2 = adc.read(&mut inputs.alarm_in_2).await;
         let val3 = adc.read(&mut inputs.alarm_in_3).await;
+        
+        // Removed high-frequency logging to prevent console flooding, 
+        // but you can uncomment for debugging.
+        // info!("val1: {}, val2: {}, val3: {}", val1, val2, val3);
 
         let bools = [
             val1 > LOW_INTRUSION_THRESHOLD && val1 < HIGH_INTRUSION_THRESHOLD,
@@ -105,30 +108,27 @@ async fn adc_monitor_task(mut inputs: AnalogInputs) {
 #[embassy_executor::task]
 async fn logic_task(mut outputs: AlarmOutputs) {
     loop {
-        // 1. Process Events from SIM800 (SMS/Calls)
-        if let Ok(event) = EVENT_CHANNEL.try_receive() {
-            match event {
-                SimEvent::SmsReceived { message, .. } => {
-                    if let Some(alarm_str) = custom_strings::extract_before_delimiter(&message, ";") {
-                         if alarm_str.len() == ALARMS_MESSAGE_STRING_LENGTH {
-                             play_alarms(&mut outputs, alarm_str).await;
-                         }
-                    }
-                },
-                SimEvent::CallReceived { number } => {
-                    CMD_CHANNEL.send(Command::HandleIncomingCall { phone_number: number }).await;
-                },
-                SimEvent::DtmfReceived(c) => {
-                     info!("DTMF: {}", c);
-                }
-                _ => {}
-            }
+        // 1. Process Events from SIM800 (SMS/Calls) that don't need blocking waits
+        while let Ok(event) = EVENT_CHANNEL.try_receive() {
+            handle_general_sim_event(event, &mut outputs).await;
         }
 
-        // 2. Process Alarm Stack Logic (Sending Alarms)
+        // 2. Process Alarm Stack Logic
+        let mut pending_dtmf: Option<String<DTMF_PACKET_LENGTH>> = None;
+        let mut pending_sms: Option<String<SIM800_LINE_BUFFER_SIZE>> = None;
+        let mut is_sms = false;
+
+        // SCOPE THE LOCK: Ensure state is dropped before long-running async operations
         {
             let mut state = STATE.lock().await;
             let tick = state.alive_countdown <= 0;
+            
+            // Only log if interesting things happen or periodically
+            if tick {
+                let v = state.alarm_stack.get_stack_view();
+                info!("Alarm Stack: [{},{},{}]", v[0][0], v[0][1], v[0][2]);
+            }
+
             if state.alarm_stack.has_changes() || tick {
                 let bits = state.alarm_stack.export_bits();
                 let str_stack: String<DTMF_PACKET_LENGTH> = bits.iter().collect();
@@ -139,15 +139,78 @@ async fn logic_task(mut outputs: AlarmOutputs) {
                      let mut msg: String<SIM800_LINE_BUFFER_SIZE> = String::new();
                      use core::fmt::Write;
                      let _ = write!(msg, "{}{}", SMS_PREFIX, str_stack);
-                     CMD_CHANNEL.send(Command::SendAlarmSms { message: msg }).await;
+                     pending_sms = Some(msg);
+                     is_sms = true;
                 } else {
-                     CMD_CHANNEL.send(Command::CallAlarmWithDtmf { dtmf: str_stack }).await;
+                     pending_dtmf = Some(str_stack);
                 }
             }
-            state.alive_countdown -= 1;
+            if !tick {
+                state.alive_countdown -= 1;
+            }
+        } // <--- MutexGuard dropped here, freeing STATE for adc_monitor_task
+
+        // 3. Perform blocking/long operations without the lock
+        if is_sms {
+            if let Some(msg) = pending_sms {
+                CMD_CHANNEL.send(Command::SendAlarmSms { message: msg }).await;
+            }
+        } else if let Some(dtmf) = pending_dtmf {
+            // Reliable delivery loop
+            loop {
+                info!("Sending Alarm DTMF: {}", dtmf.as_str());
+                CMD_CHANNEL.send(Command::CallAlarmWithDtmf { dtmf: dtmf.clone() }).await;
+                
+                // Wait for completion result or other events
+                let mut confirmed = false;
+                
+                // Event loop waiting for specific result
+                loop {
+                    let event = EVENT_CHANNEL.receive().await;
+                    match event {
+                        SimEvent::CallExecuted(success) => {
+                            if success {
+                                info!("Alarm delivered successfully.");
+                                confirmed = true;
+                            } else {
+                                warn!("Alarm delivery failed. Retrying in 10s...");
+                            }
+                            break; // Exit event wait loop to check confirmation status
+                        }
+                        // Handle other events while waiting (e.g., incoming SMS)
+                        _ => handle_general_sim_event(event, &mut outputs).await,
+                    }
+                }
+
+                if confirmed {                    
+                    break; // Exit retry loop
+                }
+                
+                // Wait before retry
+                Timer::after(Duration::from_secs(10)).await;
+            }
         }
 
         Timer::after(Duration::from_secs(60)).await;
+    }
+}
+
+async fn handle_general_sim_event(event: SimEvent, outputs: &mut AlarmOutputs) {
+    match event {
+        SimEvent::SmsReceived { message, .. } => {
+            if let Some(alarm_str) = custom_strings::extract_before_delimiter(&message, ";") {
+                 if alarm_str.len() == ALARMS_MESSAGE_STRING_LENGTH {
+                     play_alarms(outputs, alarm_str).await;
+                 }
+            }
+        },
+        SimEvent::CallReceived { number } => {
+            CMD_CHANNEL.send(Command::HandleIncomingCall { phone_number: number }).await;
+        },
+        SimEvent::DtmfReceived(c) => {
+             info!("DTMF: {}", c);
+        }
+        _ => {}
     }
 }
 
