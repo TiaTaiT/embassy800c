@@ -2,93 +2,166 @@
 #![no_std]
 #![no_main]
 
-mod hardware;
-mod sim800; // The file above
+use defmt::info;
+use defmt_rtt as _;
+use panic_probe as _;
 
-use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::gpio::{AnyPin, Level, Output, Speed};
-use embassy_stm32::Peri;
-use embassy_time::{Timer, Duration};
-use embassy_sync::channel::Channel;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
+use embassy_sync::mutex::Mutex;
+use embassy_time::{Duration, Timer};
+use heapless::String;
 
-use {defmt_rtt as _, panic_probe as _};
+mod constants;
+mod hardware;
+mod alarms_handler;
+mod rtc;
+mod sim800;
+mod gsm_time_converter;
+mod date_converter;
+mod phone_book;
+mod custom_strings;
 
-use hardware::init;
-use sim800::{Sim800, SimEvent, rx_runner};
+use crate::constants::*;
+use crate::hardware::{AnalogInputs, AlarmOutputs};
+use crate::alarms_handler::{AlarmStack, AlarmTracker};
+use crate::rtc::RtcControl;
+use crate::sim800::{Command, Sim800Driver, SimEvent};
 
-// Create a static channel for Events coming from the SIM800
+// --- Global Signals/Channels ---
+static CMD_CHANNEL: Channel<CriticalSectionRawMutex, Command, 4> = Channel::new();
 static EVENT_CHANNEL: Channel<CriticalSectionRawMutex, SimEvent, 4> = Channel::new();
 
-#[embassy_executor::task]
-async fn sim800_bg_task(rx: embassy_stm32::usart::UartRx<'static, embassy_stm32::mode::Async>) {
-    // This function never returns. It handles the parsing.
-    rx_runner(rx, &EVENT_CHANNEL).await;
+// Shared State
+struct SystemState {
+    alarm_stack: AlarmStack,
+    alive_countdown: i32,
+    cancellation_token: u32,
 }
 
-#[embassy_executor::task(pool_size = 2)]
-async fn blink_task(pin: Peri<'static, AnyPin>, interval_ms: u64) {
-    let mut led = Output::new(pin, Level::Low, Speed::Low);
-    loop {
-        led.toggle();
-        Timer::after_millis(interval_ms).await;
-    }
-}
+static STATE: Mutex<CriticalSectionRawMutex, SystemState> = Mutex::new(SystemState {
+    // Corrected to use the public `new` constructor
+    alarm_stack: AlarmStack::new(), 
+    alive_countdown: 0,
+    cancellation_token: 0,
+});
+
+static RTC: Mutex<CriticalSectionRawMutex, Option<RtcControl>> = Mutex::new(None);
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let mut board = init();
+    let board = hardware::init();
     
-    info!("Starting...");
-
-    // 1. Spawn the Background Reader
-    spawner.spawn(sim800_bg_task(board.uart2_rx)).unwrap();
-
-    // 2. Create the Controller (Owns TX)
-    let modem = Sim800::new(board.uart2_tx);
-
-    // 3. Initialize Modem (Linear code!)
-    if modem.init().await {
-        info!("Modem Initialized & Ready");
-    } else {
-        error!("Modem Init Failed");
+    // RTC Init
+    {
+        let rtc_ctrl = RtcControl::init();
+        let mut rtc_lock = RTC.lock().await;
+        *rtc_lock = Some(rtc_ctrl);
     }
 
-    // 4. Send a test SMS?
-    // modem.send_sms("+1234567890", "Hello from Embassy!").await;
+    info!("Starting Embassy800c...");
 
+    // Spawn Tasks
+    spawner.spawn(sim800_task(board.uart2_tx, board.uart2_rx, board.sim800_control)).unwrap();
+    spawner.spawn(adc_monitor_task(board.analog_inputs)).unwrap();
+    spawner.spawn(logic_task(board.alarm_outputs)).unwrap();
+    spawner.spawn(system_monitor_task()).unwrap();
+}
+
+#[embassy_executor::task]
+async fn sim800_task(tx: hardware::Uart2Tx, rx: hardware::Uart2Rx, control: hardware::Sim800Control) {
+    let mut driver = Sim800Driver::new(tx, rx, control);
+    
+    // Command Init
+    CMD_CHANNEL.send(Command::Init).await;
+
+    driver.run(CMD_CHANNEL.receiver(), EVENT_CHANNEL.sender()).await;
+}
+
+#[embassy_executor::task]
+async fn adc_monitor_task(mut inputs: AnalogInputs) {
+    let mut adc = inputs.adc;
     loop {
-        // We select between user actions and incoming events
-        use embassy_futures::select::{select, Either};
+        let val1 = adc.read(&mut inputs.alarm_in_1).await;
+        let val2 = adc.read(&mut inputs.alarm_in_2).await;
+        let val3 = adc.read(&mut inputs.alarm_in_3).await;
 
-        // Example: Wait for an event OR wait 10 seconds to blink
-        match select(
-            EVENT_CHANNEL.receive(),
-            Timer::after(Duration::from_secs(10))
-        ).await {
-            Either::First(event) => {
-                match event {
-                    SimEvent::IncomingCall(num) => {
-                        info!("Incoming call from: {}", num);
-                        // Logic to auto-answer or hangup
-                        // modem.make_call(...); // or hangup
-                        modem.hang_up().await;
-                    },
-                    SimEvent::SmsReceived(sms) => {
-                        info!("SMS from {}: {}", sms.number, sms.message);
-                        // Reply?
-                        // modem.send_sms(&sms.number, "Got it!").await;
-                    },
-                    SimEvent::CallEnded => info!("Call Ended"),
-                    SimEvent::SystemReady => info!("System became ready"),
-                    _ => {}
+        let bools = [
+            val1 > LOW_INTRUSION_THRESHOLD && val1 < HIGH_INTRUSION_THRESHOLD,
+            val2 > LOW_INTRUSION_THRESHOLD && val2 < HIGH_INTRUSION_THRESHOLD,
+            val3 > LOW_INTRUSION_THRESHOLD && val3 < HIGH_INTRUSION_THRESHOLD,
+        ];
+
+        {
+            let mut state = STATE.lock().await;
+            state.alarm_stack.push(&bools);
+        }
+
+        Timer::after(Duration::from_millis(500)).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn logic_task(mut outputs: AlarmOutputs) {
+    loop {
+        // 1. Process Events from SIM800 (SMS/Calls)
+        if let Ok(event) = EVENT_CHANNEL.try_receive() {
+            match event {
+                SimEvent::SmsReceived { message, .. } => {
+                    if let Some(alarm_str) = custom_strings::extract_before_delimiter(&message, ";") {
+                         if alarm_str.len() == ALARMS_MESSAGE_STRING_LENGTH {
+                             play_alarms(&mut outputs, alarm_str).await;
+                         }
+                    }
+                },
+                SimEvent::CallReceived { number } => {
+                    CMD_CHANNEL.send(Command::HandleIncomingCall { phone_number: number }).await;
+                },
+                SimEvent::DtmfReceived(c) => {
+                     info!("DTMF: {}", c);
                 }
-            },
-            Either::Second(_) => {
-                info!("Heartbeat tick...");
-                // Periodically check status or send AT?
+                _ => {}
             }
         }
+
+        // 2. Process Alarm Stack Logic (Sending Alarms)
+        {
+            let mut state = STATE.lock().await;
+            let tick = state.alive_countdown <= 0;
+            if state.alarm_stack.has_changes() || tick {
+                let bits = state.alarm_stack.export_bits();
+                let str_stack: String<DTMF_PACKET_LENGTH> = bits.iter().collect();
+                
+                state.alive_countdown = ALIVE_PERIOD_MINUTES + 1;
+
+                if USE_SMS {
+                     let mut msg: String<SIM800_LINE_BUFFER_SIZE> = String::new();
+                     use core::fmt::Write;
+                     let _ = write!(msg, "{}{}", SMS_PREFIX, str_stack);
+                     CMD_CHANNEL.send(Command::SendAlarmSms { message: msg }).await;
+                } else {
+                     CMD_CHANNEL.send(Command::CallAlarmWithDtmf { dtmf: str_stack }).await;
+                }
+            }
+            state.alive_countdown -= 1;
+        }
+
+        Timer::after(Duration::from_secs(60)).await;
+    }
+}
+
+async fn play_alarms(outputs: &mut AlarmOutputs, alarm_str: &str) {
+    info!("Playing alarms: {}", alarm_str);
+    outputs.alarm_out_1.set_high();
+    Timer::after(Duration::from_secs(3)).await;
+    outputs.alarm_out_1.set_low();
+}
+
+#[embassy_executor::task]
+async fn system_monitor_task() {
+    loop {
+        Timer::after(Duration::from_secs(SYSTEM_MONITOR_PERIOD_HOURS as u64 * 3600)).await;
+        CMD_CHANNEL.send(Command::UpdateTime).await;
     }
 }

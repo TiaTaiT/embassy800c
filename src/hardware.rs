@@ -1,8 +1,8 @@
 // /src/hardware.rs
 use embassy_stm32::adc::{Adc, SampleTime};
-use embassy_stm32::gpio::{AnyPin, Level, Output, Speed};
+use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::mode::Async;
-use embassy_stm32::peripherals::{self, ADC1, PA4, PA5, PA6};
+use embassy_stm32::peripherals::{ADC1, PA4, PA5, PA6};
 use embassy_stm32::rcc::{Hse, HseMode, Pll, PllMul, PllPreDiv, PllSource, Sysclk};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{Config as UartConfig, Uart, UartRx, UartTx};
@@ -10,14 +10,15 @@ use embassy_stm32::{adc, bind_interrupts, usart, Config, Peri};
 use defmt::info;
 
 bind_interrupts!(pub struct Irqs {
-    ADC1_COMP => adc::InterruptHandler<peripherals::ADC1>;
-    USART1 => usart::InterruptHandler<peripherals::USART1>;
-    USART2 => usart::InterruptHandler<peripherals::USART2>;
+    ADC1_COMP => adc::InterruptHandler<ADC1>;
+    USART1 => usart::InterruptHandler<embassy_stm32::peripherals::USART1>;
+    USART2 => usart::InterruptHandler<embassy_stm32::peripherals::USART2>;
 });
 
 // Correct Type Aliases for Async UART
 pub type Uart1 = Uart<'static, Async>;
-pub type Uart2 = Uart<'static, Async>;
+pub type Uart2Rx = UartRx<'static, Async>;
+pub type Uart2Tx = UartTx<'static, Async>;
 pub type Adc1 = Adc<'static, ADC1>;
 
 pub struct AnalogInputs {
@@ -28,8 +29,8 @@ pub struct AnalogInputs {
 }
 
 pub struct Leds {
-    pub led3: Peri<'static, AnyPin>,
-    pub led4: Peri<'static, AnyPin>,
+    pub led3: Output<'static>,
+    pub led4: Output<'static>,
 }
 
 pub struct AlarmOutputs {
@@ -47,11 +48,10 @@ pub struct Board {
     pub analog_inputs: AnalogInputs, 
     pub alarm_outputs: AlarmOutputs,
     pub uart1: Uart1,
-    pub uart2_rx: UartRx<'static, Async>,
-    pub uart2_tx: UartTx<'static, Async>,
+    pub uart2_rx: Uart2Rx,
+    pub uart2_tx: Uart2Tx,
     pub leds: Leds,
     pub sim800_control: Sim800Control,
-    pub _alarm_pullup: Output<'static>,
 }
 
 pub fn init() -> Board {
@@ -72,7 +72,8 @@ pub fn init() -> Board {
     info!("Hardware initialized! Clocked at 48MHz");
 
     // 2. Additional Outputs
-    let alarm_pullup = Output::new(p.PA7, Level::High, Speed::Low);
+    let _alarm_pullup = Output::new(p.PA7, Level::High, Speed::Low); 
+    
     let alarm_out_1 = Output::new(p.PB3, Level::High, Speed::Low);
     let alarm_out_2 = Output::new(p.PB4, Level::High, Speed::Low);
     let alarm_out_3 = Output::new(p.PB5, Level::High, Speed::Low);
@@ -119,13 +120,13 @@ pub fn init() -> Board {
     };
 
     let leds = Leds {
-        led3: p.PC8.into(),
-        led4: p.PC9.into(),
+        led3: Output::new(p.PC9, Level::Low, Speed::Low),
+        led4: Output::new(p.PC8, Level::Low, Speed::Low),
     };
 
     let sim800_control = Sim800Control {
-        sim800_enable: out_pc6,
-        sim800_ttl: out_pc7,
+        sim800_enable: out_pc7,
+        sim800_ttl: out_pc6,
     };
 
     Board {
@@ -136,6 +137,5 @@ pub fn init() -> Board {
         uart2_tx,
         leds,
         sim800_control,
-        _alarm_pullup: alarm_pullup,
     }
 }
