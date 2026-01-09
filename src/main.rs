@@ -39,13 +39,11 @@ static EVENT_CHANNEL: Channel<CriticalSectionRawMutex, SimEvent, 4> = Channel::n
 struct SystemState {
     alarm_stack: AlarmStack,
     alive_countdown: i32,
-    cancellation_token: u32,
 }
 
 static STATE: Mutex<CriticalSectionRawMutex, SystemState> = Mutex::new(SystemState {
     alarm_stack: AlarmStack::new(), 
     alive_countdown: 0,
-    cancellation_token: 0,
 });
 
 static RTC: Mutex<CriticalSectionRawMutex, Option<RtcControl>> = Mutex::new(None);
