@@ -105,7 +105,6 @@ pub fn init() -> Board {
 
     // 5. ADC
     let mut adc = Adc::new(p.ADC1, Irqs);
-    adc.set_sample_time(SampleTime::CYCLES71_5);
 
     let analog_inputs = AnalogInputs {
         alarm_pullup,

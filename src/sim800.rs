@@ -7,6 +7,7 @@ use crate::constants::*;
 use crate::custom_strings::{extract_between_delimiters, extract_after_delimiter, separate_chars_by_commas};
 use crate::hardware::{Uart2Rx, Uart2Tx, Sim800Control};
 use crate::phone_book::PhoneBook;
+use crate::rtc::GsmTime;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::{Sender, Receiver};
 
@@ -46,8 +47,8 @@ pub enum SimEvent {
     },
     DtmfReceived(char),
     CallEnded,
-    // Added CallExecuted variant to report status of outgoing alarm calls
     CallExecuted(bool),
+    TimeReceived(GsmTime),
 }
 
 pub struct Sim800Driver {
@@ -55,9 +56,7 @@ pub struct Sim800Driver {
     rx: Uart2Rx,
     control: Sim800Control,
     phone_book: PhoneBook,
-    // Buffer for reading lines
     line_buf: [u8; 128],
-    // Deduplication state
     last_alarm_dtmf: String<DTMF_PACKET_LENGTH>,
     last_alarm_time: u64,
 }
@@ -137,6 +136,32 @@ impl Sim800Driver {
             }
         }).await.map_err(|_| ())?
     }
+
+    // Specialized handler for UpdateTime to ensure +CCLK is parsed
+    async fn execute_update_time(&mut self) -> Option<GsmTime> {
+        self.send_str("AT+CCLK?").await;
+        self.send_str("\r\n").await;
+        
+        let mut found_time = None;
+
+        let res = with_timeout(Duration::from_secs(2), async {
+            loop {
+                let line = self.read_line().await.map_err(|_| ())?;
+                if line.trim() == "OK" { return Ok(()); }
+                if line.trim() == "ERROR" { return Err(()); }
+
+                if line.contains("+CCLK:") {
+                    found_time = Self::parse_cclk(line);
+                }
+            }
+        }).await;
+
+        if res.is_ok() {
+            found_time
+        } else {
+            None
+        }
+    }
     
     // -----------------------------------------------------------------------
     // High Level Operations
@@ -206,9 +231,7 @@ impl Sim800Driver {
         self.send_str(number).await;
         self.send_str(";\r\n").await;
 
-        if self.send_cmd_wait_ok("", 5000).await.is_err() {
-            // "OK" usually comes after ATD
-        }
+        if self.send_cmd_wait_ok("", 5000).await.is_err() { }
 
         let result = with_timeout(Duration::from_secs(20), async {
              loop {
@@ -282,6 +305,29 @@ impl Sim800Driver {
         event_channel.send(SimEvent::CallEnded).await;
     }
 
+    fn parse_cclk(line: &str) -> Option<GsmTime> {
+        // Example: +CCLK: "26/01/09,23:15:31+12"
+        let content = extract_between_delimiters(line, "\"", "\"")?;
+        let bytes = content.as_bytes();
+        if bytes.len() < 17 { return None; }
+
+        let parse2 = |i: usize| -> Option<u8> {
+            let d1 = bytes[i].wrapping_sub(b'0');
+            let d2 = bytes[i+1].wrapping_sub(b'0');
+            if d1 > 9 || d2 > 9 { return None; }
+            Some(d1 * 10 + d2)
+        };
+
+        Some(GsmTime {
+            year: parse2(0)?,
+            month: parse2(3)?,
+            day: parse2(6)?,
+            hour: parse2(9)?,
+            minute: parse2(12)?,
+            second: parse2(15)?,
+        })
+    }
+
     pub async fn run(&mut self, 
         cmd_channel: Receiver<'static, CriticalSectionRawMutex, Command, 4>,
         event_channel: Sender<'static, CriticalSectionRawMutex, SimEvent, 4>
@@ -320,6 +366,12 @@ impl Sim800Driver {
                                 if let Some(val) = extract_after_delimiter(line, "+DTMF: ") {
                                     let c = val.trim().chars().next().unwrap_or(' ');
                                     event_channel.send(SimEvent::DtmfReceived(c)).await;
+                                }
+                            } else if line.contains("+CCLK:") {
+                                if let Some(time) = Self::parse_cclk(line) {
+                                    info!("Time received (URC): {}-{}-{} {}:{}:{}", 
+                                        time.year, time.month, time.day, time.hour, time.minute, time.second);
+                                    event_channel.send(SimEvent::TimeReceived(time)).await;
                                 }
                             }
                         }
@@ -360,13 +412,11 @@ impl Sim800Driver {
                              }
                              
                              if found {
-                                 // Check duplicate
                                  let is_duplicate = (dtmf == self.last_alarm_dtmf) && 
                                                     (uptime_sec.saturating_sub(self.last_alarm_time) < 120); 
                                  
                                  if is_duplicate {
                                      warn!("Skipping duplicate alarm call for DTMF {} (Last: {}s ago)", dtmf, uptime_sec - self.last_alarm_time);
-                                     // Inform logic task that we treated this as "done"
                                      event_channel.send(SimEvent::CallExecuted(true)).await;
                                  } else {
                                      info!("Calling Alarm: {} with DTMF: {}", target_num, dtmf);
@@ -375,12 +425,10 @@ impl Sim800Driver {
                                              info!("Alarm confirmed (#).");
                                              self.last_alarm_dtmf = dtmf.clone();
                                              self.last_alarm_time = uptime_sec;
-                                             // Notify success
                                              event_channel.send(SimEvent::CallExecuted(true)).await;
                                          },
                                          Err(_) => {
                                              warn!("Alarm call failed/unconfirmed.");
-                                             // Notify failure
                                              event_channel.send(SimEvent::CallExecuted(false)).await;
                                          }
                                      }
@@ -397,7 +445,13 @@ impl Sim800Driver {
                             self.handle_incoming_call_flow(&event_channel).await;
                         },
                         Command::UpdateTime => {
-                            self.send_cmd_wait_ok("AT+CCLK?", 1000).await.ok();
+                            if let Some(time) = self.execute_update_time().await {
+                                info!("Time updated (CMD): {}-{}-{} {}:{}:{}", 
+                                    time.year, time.month, time.day, time.hour, time.minute, time.second);
+                                event_channel.send(SimEvent::TimeReceived(time)).await;
+                            } else {
+                                warn!("Failed to parse time from +CCLK");
+                            }
                         },
                     }
                 }
