@@ -168,6 +168,7 @@ async fn logic_task(mut outputs: AlarmOutputs) {
                          if let Some(ref mut rtc_ctrl) = *rtc {
                              rtc_ctrl.set_time(time);
                          }
+                         info!("RTC was updated.");
                     }
                 }
             },
